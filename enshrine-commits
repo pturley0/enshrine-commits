@@ -326,17 +326,8 @@ ExamineTheEnvironment()
     # Compute the absolute path to this script.
     #-----------------------------------------------------------------------------------------------
 
-    if [[ "$0" =~ ^\. ]]
+    if [[ "$0" =~ ^/ ]]
     then
-
-        #-------------------------------------------------------------------------------------------
-        # If the path to this script on the command line begins with a '.', then it's relative, so
-        # prefix it with the absolute path to the current directory.
-        #-------------------------------------------------------------------------------------------
-
-        TheAbsolutePathToThisScript="${PWD}/$0"
-
-    else
 
         #-------------------------------------------------------------------------------------------
         # The path to this script on the command line appears to already be absolute.
@@ -344,8 +335,15 @@ ExamineTheEnvironment()
 
         TheAbsolutePathToThisScript="$0"
 
-    fi
+    else
 
+        #-------------------------------------------------------------------------------------------
+        # This path is relative, so prefix it with the absolute path to the current directory.
+        #-------------------------------------------------------------------------------------------
+
+        TheAbsolutePathToThisScript="${PWD}/$0"
+
+    fi
 
 }
 
