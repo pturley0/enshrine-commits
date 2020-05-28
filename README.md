@@ -1,5 +1,5 @@
 # `enshrine-commits`
-A command that "enshrines" an author's contributions in new repository.
+A command that "enshrines" an author's contributions in a new repository.
 
 Imagine you've made contributions to a branch in an public project, and you'd like a convenient way to specifically refer to your own work in the future. It would be ideal if you could recast your work in a new repository that:
 
