@@ -1,0 +1,765 @@
+#!/bin/bash
+#===================================================================================================
+#
+declare -r ThisCommandName=$(basename $0)
+declare -r UsageMessage="
+This command examines the series of commits indicated by a given ref, identifies
+the segment that contains all the contributions by a given author, and creates a
+new \"shrine\" repository containing only that segment, with all intervening
+commits by other authors squashed.
+
+This command has these forms:
+
+
+    ${ThisCommandName} --help
+
+        Show this message and exit immediately.
+
+
+    ${ThisCommandName} <author> <original> <ref> <shrine>
+
+        Execute the operation as indicated by the values wired into this script.
+
+        Where:
+
+            <author>    is the name of the author whose commits are to be
+                        enshrined. Make sure to use quotes if the name includes
+                        white space.
+
+            <original>  is the absolute path to the original repository.
+
+            <ref>       is a ref that indicates where the search for commits is
+                        to begin. This can be a hash.
+
+            <shrine>    is the path to a directory this script will create to
+                        contain the shrine repository.
+
+
+    ${ThisCommandName} --to-do <author> <to-do-file-path>
+
+        This form is for internal or testing use. It's invoked by a Git
+        call-back to edit a rebase to-do file.
+
+
+    ${ThisCommandName} --message <message-file-path>
+
+        This form is for internal or testing use. It's invoked by a Git
+        call-back to edit a message for a set of squashed commits.
+
+"
+#
+#===================================================================================================
+
+#---------------------------------------------------------------------------------------------------
+# Constants.
+#---------------------------------------------------------------------------------------------------
+
+# The name of the tag we place in the original repository to mark the *parent* of the earliest
+# commit to clone (we clean this after using it).
+
+declare -r ParentCommitTagName='shrine-branch-segment-parent'
+
+# The name of the tag we place in the original repository to mark the latest commit to clone (we
+# clean this after using it).
+
+declare -r LatestCommitTagName='shrine-branch-segment-latest'
+
+#---------------------------------------------------------------------------------------------------
+# Variables.
+#---------------------------------------------------------------------------------------------------
+
+# The absolute path to this script.
+
+TheAbsolutePathToThisScript=''
+
+# The author's name.
+
+AuthorName=''
+
+# The path to the original repository. This *must* be an absolute path.
+
+OriginalRepoPath=''
+
+# The name of the reference indicating the commits of interest. This can be a hash.
+
+RefName=''
+
+# The path to the shrine directory. This need not be an absolute path.
+
+ShrineRepoPath=''
+
+# The path to the file we're being asked to edit.
+
+EditableFilePath=''
+
+# The type of file we're editing.
+
+EditableFileType=''
+
+#===================================================================================================
+
+ExamineTheCommandLine()
+#---------------------------------------------------------------------------------------------------
+# Validate and comprehend the command line.
+#---------------------------------------------------------------------------------------------------
+{
+
+    #-----------------------------------------------------------------------------------------------
+    # Check if the user wants help.
+    #-----------------------------------------------------------------------------------------------
+
+    if (( $# == 1 )) && [[ "$1" == '--help' ]]
+    then
+        echo "${UsageMessage}"
+        exit 0
+    fi
+
+    #-----------------------------------------------------------------------------------------------
+    # Check if we're editing a commit message.
+    #-----------------------------------------------------------------------------------------------
+
+    if (( $# == 2 )) && [[ "$1" == '--message' ]]
+    then
+
+        #-------------------------------------------------------------------------------------------
+        # Collect arguments.
+        #-------------------------------------------------------------------------------------------
+
+        EditableFileType="$1"
+        EditableFilePath="$2"
+
+        #-------------------------------------------------------------------------------------------
+        # Make sure the file exists and is writable.
+        #-------------------------------------------------------------------------------------------
+
+        if [[ ! -w "${EditableFilePath}" ]]
+        then
+            echo "Could not write to file ${EditableFilePath}" >&2
+            exit 1
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # Good to go.
+        #-------------------------------------------------------------------------------------------
+
+        return
+
+    fi
+
+    #-----------------------------------------------------------------------------------------------
+    # Check if we're editing a rebase to-do file.
+    #-----------------------------------------------------------------------------------------------
+
+    if (( $# == 3 )) && [[ "$1" == '--to-do' ]]
+    then
+
+        #-------------------------------------------------------------------------------------------
+        # Collect arguments.
+        #-------------------------------------------------------------------------------------------
+
+        EditableFileType="$1"
+        AuthorName=$(URLDecode "$2")
+        EditableFilePath="$3"
+
+        #-------------------------------------------------------------------------------------------
+        # Make sure the file exists and is writable.
+        #-------------------------------------------------------------------------------------------
+
+        if [[ ! -w "${EditableFilePath}" ]]
+        then
+            echo "Could not write to file ${EditableFilePath}" >&2
+            exit 1
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # Good to go.
+        #-------------------------------------------------------------------------------------------
+
+        return
+
+    fi
+
+    #-----------------------------------------------------------------------------------------------
+    # Check if we're enshrining someone.
+    #-----------------------------------------------------------------------------------------------
+
+    if (( $# == 4 ))
+    then
+
+        #-------------------------------------------------------------------------------------------
+        # Collect arguments.
+        #-------------------------------------------------------------------------------------------
+
+        AuthorName="$1"
+        OriginalRepoPath="$2"
+        RefName="$3"
+        ShrineRepoPath="$4"
+
+        #-------------------------------------------------------------------------------------------
+        # Validate the original repository directory path.
+        #-------------------------------------------------------------------------------------------
+
+        if ! [[ "${OriginalRepoPath}" =~ ^/ ]]
+        then
+            echo "The original repository path must be absolute" >&2
+            exit 1
+        fi
+
+        if ! [[ -d "${OriginalRepoPath}" ]]
+        then
+            echo "The original repository path doesn't exist or isn't a directory" >&2
+            exit 1
+        fi
+
+        if ! [[ -d "${OriginalRepoPath}/.git" ]]
+        then
+            echo "The original repository path doesn't indicate a Git repository" >&2
+            exit 1
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # Good to go.
+        #-------------------------------------------------------------------------------------------
+
+        return
+
+    fi
+
+    #-----------------------------------------------------------------------------------------------
+    # If control arrives here, we have no idea what's going on.
+    #-----------------------------------------------------------------------------------------------
+
+    echo "${UsageMessage}" >&2
+    exit 1
+
+}
+
+#===================================================================================================
+
+URLEncode()
+#---------------------------------------------------------------------------------------------------
+# URL encode a string.
+#
+# Credit to https://gist.github.com/cdown/1163649
+#---------------------------------------------------------------------------------------------------
+{
+
+    #-----------------------------------------------------------------------------------------------
+    # Collect the string.
+    #-----------------------------------------------------------------------------------------------
+
+    String="${1}"
+
+    #-----------------------------------------------------------------------------------------------
+    # Make sure we're viewing the incoming string through the C locale.
+    #-----------------------------------------------------------------------------------------------
+
+    local OldCollation=$LC_COLLATE
+
+    LC_COLLATE=C
+
+    #-----------------------------------------------------------------------------------------------
+    # Loop over characters in the string.
+    #-----------------------------------------------------------------------------------------------
+
+    local Length="${#String}"
+
+    for (( i = 0; i < Length; i++ ))
+    do
+
+        #-------------------------------------------------------------------------------------------
+        # Extract the current character.
+        #-------------------------------------------------------------------------------------------
+
+        local c="${1:i:1}"
+
+        #-------------------------------------------------------------------------------------------
+        # Encode the current character, if necessary, and add the result to the output.
+        #-------------------------------------------------------------------------------------------
+
+        case $c in
+
+            [a-zA-Z0-9.~_-])
+                # These characters need not be encoded.
+                printf "$c"
+                ;;
+
+            *)
+                # Encode this character.
+                printf '%%%02X' "'$c"
+                ;;
+
+        esac
+
+    done
+
+    #-----------------------------------------------------------------------------------------------
+    # Restore the previous locale.
+    #-----------------------------------------------------------------------------------------------
+
+    LC_COLLATE="${OldCollation}"
+
+}
+
+#===================================================================================================
+
+URLDecode()
+#---------------------------------------------------------------------------------------------------
+# URL decode a string.
+#
+# Credit to https://gist.github.com/cdown/1163649
+#---------------------------------------------------------------------------------------------------
+{
+    local Encoded="${1//+/ }"
+    printf '%b' "${Encoded//%/\\x}"
+}
+
+#===================================================================================================
+
+ExamineTheEnvironment()
+#---------------------------------------------------------------------------------------------------
+# Validate and comprehend the environment.
+#---------------------------------------------------------------------------------------------------
+{
+
+    #-----------------------------------------------------------------------------------------------
+    # Compute the absolute path to this script.
+    #-----------------------------------------------------------------------------------------------
+
+    if [[ "$0" =~ ^\. ]]
+    then
+
+        #-------------------------------------------------------------------------------------------
+        # If the path to this script on the command line begins with a '.', then it's relative, so
+        # prefix it with the absolute path to the current directory.
+        #-------------------------------------------------------------------------------------------
+
+        TheAbsolutePathToThisScript="${PWD}/$0"
+
+    else
+
+        #-------------------------------------------------------------------------------------------
+        # The path to this script on the command line appears to already be absolute.
+        #-------------------------------------------------------------------------------------------
+
+        TheAbsolutePathToThisScript="$0"
+
+    fi
+
+
+}
+
+#===================================================================================================
+
+EditAFile()
+#---------------------------------------------------------------------------------------------------
+# This function receives control when Git has "called back" to this script to edit either a rebase
+# to-do file or a commit message file.
+#---------------------------------------------------------------------------------------------------
+{
+
+    #-----------------------------------------------------------------------------------------------
+    # Are we editing a commit message file?
+    #-----------------------------------------------------------------------------------------------
+
+    if [[ "${EditableFileType}" == '--message' ]]
+    then
+
+        #-------------------------------------------------------------------------------------------
+        # If control arrives here, we're editing a commit message Git produced when it sqashed a
+        # number of commits together. We accept the result without change.
+        #-------------------------------------------------------------------------------------------
+
+        exit 0
+
+    fi
+
+    #-----------------------------------------------------------------------------------------------
+    # If control arrives here, we're editing a rebase to-do file.
+    #
+    # Begin by reading the to-do file into an array.
+    #-----------------------------------------------------------------------------------------------
+
+    local ToDoArray=()
+
+    while read -r LineBuffer
+    do
+
+        #-------------------------------------------------------------------------------------------
+        # Skip blank lines.
+        #-------------------------------------------------------------------------------------------
+
+        if [[ -z "${LineBuffer}" ]]
+        then
+            continue
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # Skip comments.
+        #-------------------------------------------------------------------------------------------
+
+        local Octothorpe='#'
+
+        if [[ "${LineBuffer}" =~ ^${Octothorpe} ]]
+        then
+            continue
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # Add this line to the array.
+        #-------------------------------------------------------------------------------------------
+
+        ToDoArray+=("${LineBuffer}")
+
+    done < "$EditableFilePath"
+
+    #-----------------------------------------------------------------------------------------------
+    # As we loop through the to-do array, this variable keeps track of whether a commit should be
+    # squashed into the previous one.
+    #
+    # Naturally, the first commit must *not* be squashed.
+    #-----------------------------------------------------------------------------------------------
+
+    local Squash='false'
+
+    #-----------------------------------------------------------------------------------------------
+    # Loop over elements in the to-do array.
+    #-----------------------------------------------------------------------------------------------
+
+    for (( i = 0; i < ${#ToDoArray[@]} ; i++ ))
+    do
+
+        #-------------------------------------------------------------------------------------------
+        # Extract the text in the current array element.
+        #-------------------------------------------------------------------------------------------
+
+        local LineBuffer="${ToDoArray[$((i))]}"
+
+        #-------------------------------------------------------------------------------------------
+        # Check if the current commit belongs to the author.
+        #-------------------------------------------------------------------------------------------
+
+        if [[ "${LineBuffer}" =~  ${AuthorName}$ ]]
+        then
+
+            #---------------------------------------------------------------------------------------
+            # If control arrives here, this command represents the author's commit, so:
+            #
+            #   --  We don't want to change it, so we simply pass over it.
+            #
+            #   -- The next commit should *not* be squashed into this one.
+            #
+            #---------------------------------------------------------------------------------------
+
+            Squash='false'
+
+            #---------------------------------------------------------------------------------------
+            # Go to the next element.
+            #---------------------------------------------------------------------------------------
+
+            continue
+
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # If control arrives here, this line represents a commit *other* than the author's.
+        #
+        # Check if we're supposed to squash it.
+        #-------------------------------------------------------------------------------------------
+
+        if [[ "${Squash}" == 'false' ]]
+        then
+
+            #---------------------------------------------------------------------------------------
+            # If the next commit doesn't belong to the authoer, it *should* be squashed into this
+            # one.
+            #---------------------------------------------------------------------------------------
+
+            Squash='true'
+
+            #---------------------------------------------------------------------------------------
+            # Go to the next element.
+            #---------------------------------------------------------------------------------------
+
+            continue
+
+        fi
+
+        #-------------------------------------------------------------------------------------------
+        # If control arrives here, this line represents a commit *other* than the author's, and
+        # we're supposed to squash it.
+        #-------------------------------------------------------------------------------------------
+
+        ToDoArray[$((i))]="${LineBuffer/pick /squash }"
+
+    done
+
+    #-----------------------------------------------------------------------------------------------
+    # Write out the to-do array.
+    #-----------------------------------------------------------------------------------------------
+
+    > "${EditableFilePath}"
+
+    for LineBuffer in "${ToDoArray[@]}"
+    do
+        echo "${LineBuffer}" >> "${EditableFilePath}"
+    done
+
+    #-----------------------------------------------------------------------------------------------
+    # Exit with success.
+    #-----------------------------------------------------------------------------------------------
+
+    exit 0
+
+}
+
+#===================================================================================================
+# Main.
+#===================================================================================================
+
+#---------------------------------------------------------------------------------------------------
+# Check the command line.
+#---------------------------------------------------------------------------------------------------
+
+ExamineTheCommandLine "$@"
+
+#---------------------------------------------------------------------------------------------------
+# Check if we're editing a file.
+#---------------------------------------------------------------------------------------------------
+
+if [[ ! -z "${EditableFilePath}" ]]
+then
+    EditAFile
+    # Control does not return.
+fi
+
+#---------------------------------------------------------------------------------------------------
+# Check the environment.
+#---------------------------------------------------------------------------------------------------
+
+ExamineTheEnvironment
+
+#---------------------------------------------------------------------------------------------------
+# Tell the user what we're doing.
+#---------------------------------------------------------------------------------------------------
+
+echo "
+Examining the original repository in ${OriginalRepoPath} ...
+"
+
+#---------------------------------------------------------------------------------------------------
+# Find the latest commit in this branch belonging to the author.
+#---------------------------------------------------------------------------------------------------
+
+LatestCommitHash=$(
+    git -C "${OriginalRepoPath}" log --oneline --max-count=1 --author="${AuthorName}" "${RefName}" |
+    sed -e 's/^\([^ ][^ ]*\).*$/\1/'
+    )
+
+if [[ -z "${LatestCommitHash}" ]]
+then
+    echo "No commit by ${AuthorName} in branch ${RefName}"
+    exit 1
+fi
+
+#---------------------------------------------------------------------------------------------------
+# Find the first commit in this branch belonging to the author.
+#---------------------------------------------------------------------------------------------------
+
+FirstCommitHash=$(
+    git -C "${OriginalRepoPath}" log --oneline --author="${AuthorName}" "${RefName}" |
+    sed -n -e '
+        ${
+            s/^\([^ ][^ ]*\).*$/\1/
+            p
+        }
+        '
+    )
+
+#---------------------------------------------------------------------------------------------------
+# Report.
+#---------------------------------------------------------------------------------------------------
+
+OriginalRepoSize=$(du -sh ${OriginalRepoPath} | sed -e 's/^ *\([^ 	][^ 	]*\).*$/\1/')
+
+echo "
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┃ Original Repository Directory Name: ${OriginalRepoPath}
+┃ Original Repository Size          : ${OriginalRepoSize}
+┃ Ref Name                          : ${RefName}
+┃ Author Name                       : ${AuthorName}
+┃ First Commit Hash                 : ${FirstCommitHash}
+┃ Latest Commit Hash                : ${LatestCommitHash}
+┃ Shrine Repository Directory Path  : ${ShrineRepoPath}
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"
+
+#---------------------------------------------------------------------------------------------------
+# Tell the user what we're doing.
+#---------------------------------------------------------------------------------------------------
+
+echo "
+Constructing the initial shrine in ${ShrineRepoPath} ...
+"
+
+#---------------------------------------------------------------------------------------------------
+# Clean.
+#---------------------------------------------------------------------------------------------------
+
+rm -rf "${ShrineRepoPath}"
+
+#---------------------------------------------------------------------------------------------------
+# Apply some tags to the original repository.
+#
+# We have to use tags because the git clone options we need won't accept hashes - only references.
+#---------------------------------------------------------------------------------------------------
+
+# Clean and install the tag that marks the parent of the branch segment.
+#
+# We set the parent commit tag two commits before the first by the author. The parent itself won't
+# be included but its child will. In the new repository, we want to include the commit just before
+# the first by the auther so the author's first commit won't be swamped with the arrival of every
+# file in the tree.
+
+git -C "${OriginalRepoPath}" tag -d "${ParentCommitTagName}" > /dev/null 2>&1
+git -C "${OriginalRepoPath}" tag "${ParentCommitTagName}" "${FirstCommitHash}^^"
+
+# Clean and install the tag that marks the latest commit of the branch segment.
+
+git -C "${OriginalRepoPath}" tag -d "${LatestCommitTagName}" > /dev/null 2>&1
+git -C "${OriginalRepoPath}" tag "${LatestCommitTagName}" "${LatestCommitHash}"
+
+#---------------------------------------------------------------------------------------------------
+# Clone the original repository.
+#---------------------------------------------------------------------------------------------------
+
+git clone \
+    --no-hardlinks \
+    --no-checkout \
+    --no-tags \
+    --branch="${LatestCommitTagName}" \
+    --single-branch \
+    --shallow-exclude="${ParentCommitTagName}" \
+    "file://${OriginalRepoPath}" \
+    "${ShrineRepoPath}"
+
+if (( $? != 0 ))
+then
+    echo "Clone failed" >&2
+    exit 1
+fi
+
+#---------------------------------------------------------------------------------------------------
+# Clean tags from the original repository.
+#---------------------------------------------------------------------------------------------------
+
+git -C "${OriginalRepoPath}" tag -d "${ParentCommitTagName}" > /dev/null 2>&1
+git -C "${OriginalRepoPath}" tag -d "${LatestCommitTagName}" > /dev/null 2>&1
+
+#---------------------------------------------------------------------------------------------------
+# Clean up the shrine repository:
+#
+#   --  The origin remote is of no use, so delete it.
+#
+#   --  It turns out that the tag on the latest commit comes over into the new repository (despite
+#       the --no-tags option to git clone), so delete it.
+#---------------------------------------------------------------------------------------------------
+
+git -C "${ShrineRepoPath}" remote remove origin
+git -C "${ShrineRepoPath}" tag -d "${LatestCommitTagName}" > /dev/null 2>&1
+
+#---------------------------------------------------------------------------------------------------
+# Tell the user what we're doing.
+#---------------------------------------------------------------------------------------------------
+
+echo "
+Squashing uninteresting commits ...
+"
+
+#---------------------------------------------------------------------------------------------------
+# Use an interactive git rebase to squash commits by other authors.
+#
+# We set up some temporary Git configuration for the duration of this command. We prefer to set
+# environment variables because they can override configuration variables.
+#
+#   --  We set GIT_EDITOR to install this script as the editor for commit messages.
+#
+#       When we squash a series of commits into one, Git combines their messages and starts an
+#       editor so the user can change the result. We don't want an editor to pop up, so we intercept
+#       this action and just accept the new message.
+#
+#   --  We set GIT_SEQUENCE_EDITOR to install this script as the editor for rebase to-do files.
+#
+#       As part of an interactive rebase, after Git has created the initial to-do file, it starts an
+#       editor so the user can change it. We don't want the user to see this file -- we want to edit
+#       it programmatically.
+#
+#       Git will be "calling back" to a new instance of this script, and that instance won't know
+#       the author's name, so we must pass it. The command string we set here will be eval'ed, so it
+#       mustn't contain spaces or any other nonsense that can confuse the shell. For that reason,
+#       we pass a URL encoded version of the author's name.
+#
+#   --  We set rebase.instructionFormat so entries in the to-do file show the author name.
+#
+#       By default, the rebase to-do file does *not* show author names. There's doesn't seem to be
+#       an equivalent environment variable.
+#
+# All the commits in the new repository retain their original hashes, even though the history before
+# them has been obliterated (see git replace). So, in the shrine repository, we can use the same
+# first commit hash as we discovered in the original repository. Of course, all this will change
+# after the rebase.
+#---------------------------------------------------------------------------------------------------
+
+# Squash.
+
+EncodedAuthorName=$(URLEncode "${AuthorName}")
+
+GIT_EDITOR="${TheAbsolutePathToThisScript} --message" \
+GIT_SEQUENCE_EDITOR="${TheAbsolutePathToThisScript} --to-do ${EncodedAuthorName}" \
+git \
+    -C "${ShrineRepoPath}" \
+    -c "rebase.instructionFormat=%an" \
+    rebase \
+        --force-rebase \
+        -i "${FirstCommitHash}"
+
+#---------------------------------------------------------------------------------------------------
+# Garbage collect the commits in the shrine repo that are no longer of use.
+#---------------------------------------------------------------------------------------------------
+
+git -C "${ShrineRepoPath}" gc
+
+#---------------------------------------------------------------------------------------------------
+# As a side effect of all the rebasing, the source tree has been checked out (recall that we
+# avoided this in the original clone with --no-checkout). Let's clean that up.
+#---------------------------------------------------------------------------------------------------
+
+(
+    cd "${ShrineRepoPath}"
+    find . -depth 1 -not -name '.git' -exec rm -rf {} \;
+)
+
+#---------------------------------------------------------------------------------------------------
+# Report.
+#---------------------------------------------------------------------------------------------------
+
+ShrineRepoSize=$(du -sh ${ShrineRepoPath} | sed -e 's/^ *\([^ 	][^ 	]*\).*$/\1/')
+
+echo "
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┃ Original Repository Directory Name: ${OriginalRepoPath}
+┃ Original Repository Size          : ${OriginalRepoSize}
+┃ Ref Name                          : ${RefName}
+┃ Author Name                       : ${AuthorName}
+┃ First Commit Hash                 : ${FirstCommitHash}
+┃ Latest Commit Hash                : ${LatestCommitHash}
+┃ Shrine Repository Directory Path  : ${ShrineRepoPath}
+┃ Shrine Repository Size            : ${ShrineRepoSize}
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"
+
+#---------------------------------------------------------------------------------------------------
+# Exit with success.
+#---------------------------------------------------------------------------------------------------
+
+exit 0
