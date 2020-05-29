@@ -23,7 +23,7 @@ This script accomplishes that. Here's the help message:
 
         enshrine-commits <author> <original> <ref> <shrine>
 
-            Execute the operation as indicated by the values wired into this script.
+            Execute the operation as indicated by the arguments.
 
             Where:
 
