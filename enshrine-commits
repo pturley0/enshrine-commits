@@ -18,7 +18,7 @@ This command has these forms:
 
     ${ThisCommandName} <author> <original> <ref> <shrine>
 
-        Execute the operation as indicated by the values wired into this script.
+        Execute the operation as indicated by the arguments.
 
         Where:
 
