@@ -699,8 +699,8 @@ Squashing uninteresting commits ...
 #
 #   --  We set rebase.instructionFormat so entries in the to-do file show the author name.
 #
-#       By default, the rebase to-do file does *not* show author names. There's doesn't seem to be
-#       an equivalent environment variable.
+#       By default, the rebase to-do file does *not* show author names. There doesn't seem to be an
+#       equivalent environment variable.
 #
 # All the commits in the new repository retain their original hashes, even though the history before
 # them has been obliterated (see git replace). So, in the shrine repository, we can use the same
